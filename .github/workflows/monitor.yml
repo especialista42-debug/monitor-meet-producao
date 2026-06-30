@@ -1,0 +1,29 @@
+name: Monitor Gravacoes Meet
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Executar monitor
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMAILS_MONITORADOS: ${{ secrets.EMAILS_MONITORADOS }}
+          OAUTH_TOKEN_BASE64: ${{ secrets.OAUTH_TOKEN_BASE64 }}
+          OAUTH_CLIENT_SECRETS_BASE64: ${{ secrets.OAUTH_CLIENT_SECRETS_BASE64 }}
+        run: python monitor.py
