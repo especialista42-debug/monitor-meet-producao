@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import pickle
 import base64
 import logging
@@ -189,7 +188,6 @@ def main():
     supabase_url = os.environ['SUPABASE_URL']
     supabase_key = os.environ['SUPABASE_KEY']
     emails_str = os.environ.get('EMAILS_MONITORADOS', '')
-    intervalo = int(os.environ.get('INTERVALO_SEGUNDOS', '300'))
 
     emails = [e.strip() for e in emails_str.split(',') if e.strip()]
     if not emails:
@@ -198,25 +196,22 @@ def main():
 
     log.info('=== Monitor de Gravacoes Google Meet ===')
     log.info(f'Emails monitorados: {emails}')
-    log.info(f'Intervalo: {intervalo}s')
 
     supabase = create_client(supabase_url, supabase_key)
     creds = get_credentials()
 
-    while True:
-        log.info('--- Iniciando ciclo ---')
-        for email in emails:
-            try:
-                process_email(supabase, creds, email)
-            except Exception as e:
-                log.error(f'Erro geral ao processar {email}: {e}')
+    log.info('--- Iniciando ciclo ---')
+    for email in emails:
+        try:
+            process_email(supabase, creds, email)
+        except Exception as e:
+            log.error(f'Erro geral ao processar {email}: {e}')
 
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            _save_token(creds)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        _save_token(creds)
 
-        log.info(f'--- Ciclo concluido. Proximo em {intervalo}s ---')
-        time.sleep(intervalo)
+    log.info('--- Ciclo concluido ---')
 
 
 if __name__ == '__main__':
