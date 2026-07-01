@@ -7,277 +7,560 @@
 
 ---
 
-## Índice
-1. Objetivo do sistema
-2. Arquitetura geral
-3. O que já está configurado
-4. O que o time de TI precisa fazer
-5. Migração para conta de serviço (service account)
-6. Adicionar os closers ao monitoramento
-7. Como validar que está funcionando
-8. Manutenção e troubleshooting
-9. Referência de credenciais e acessos
+## Contexto
+
+Este documento descreve um sistema desenvolvido pela supervisão comercial que ativa automaticamente a gravação em reuniões do Google Meet dos closers da empresa. O objetivo é que o time de TI entenda o que foi construído e replique o sistema na infraestrutura oficial da empresa.
+
+O protótipo está funcionando em contas pessoais/teste. A replicação deve ser feita em contas da empresa.
 
 ---
 
-## 1. Objetivo do sistema
+## O que o sistema faz
 
-Os closers esquecem de ativar a gravação nas reuniões do Google Meet. Isso prejudica o trabalho dos SDRs que precisam das gravações para análise.
+- A cada 5 minutos, lê a agenda de cada closer via Google Calendar API
+- Para cada reunião futura com link do Google Meet, ativa a gravação automática via Google Meet REST API
+- Registra tudo em banco de dados para não reprocessar a mesma reunião
+- Roda de graça no GitHub Actions (sem servidor, sem custo)
 
-**Solução:** um robô que roda automaticamente a cada 5 minutos, verifica a agenda de cada closer e ativa a gravação automática em toda reunião nova do Google Meet — sem que ninguém precise fazer nada.
-
-**O robô:**
-- Lê a agenda dos closers via Google Calendar API
-- Identifica reuniões futuras com link do Google Meet
-- Ativa a gravação automática via Google Meet REST API
-- Registra tudo num banco de dados (Supabase) para não reprocessar a mesma reunião
-- Roda de graça no GitHub Actions (execução automática a cada 5 minutos)
+**Limitação importante:** só detecta reuniões criadas pelo Google Agenda. Salas instantâneas (meet.new) não são detectáveis pela API.
 
 ---
 
-## 2. Arquitetura geral
+## Arquitetura
 
 ```
-GitHub Actions (roda a cada 5 min, gratuito)
+GitHub Actions (cron a cada 5 min)
         ↓
-monitor.py (script Python)
+Python script (monitor.py)
+        ↓                    ↓
+Google Calendar API     Google Meet REST API
+(lê agenda)             (ativa gravação)
         ↓
-Google Calendar API          Google Meet REST API
-(lê agenda de cada closer)   (ativa gravação)
-        ↓
-Supabase (banco de dados — registra reuniões processadas)
+Supabase (registra reuniões já processadas)
 ```
-
-**Fluxo por reunião:**
-1. Script lê eventos futuros (próximos 60 dias) da agenda do closer
-2. Para cada evento com link do Google Meet:
-   - Verifica no Supabase se já foi processado (evita duplicatas)
-   - Se não: faz GET na Meet API para obter o ID canônico da sala
-   - Faz PATCH na Meet API para ativar `autoRecordingGeneration: ON`
-   - Registra no Supabase com status (sucesso ou erro)
 
 ---
 
-## 3. O que já está configurado
+## Pré-requisitos
 
-### 3.1 Projeto no Google Cloud
-- **Nome:** `meet-auto-record-test`
-- **ID:** `372339982498`
-- **APIs habilitadas:** Google Meet REST API, Google Calendar API
-- **Conta de serviço criada:**
-  - Nome: `monitor-gravacao-meet`
-  - Email: `monitor-gravacao-meet@meet-auto-record-test.iam.gserviceaccount.com`
-  - Client ID: `116621524327967144081`
-  - Chave JSON: baixada e armazenada com a supervisão comercial
+Antes de começar, o TI precisa ter acesso a:
 
-### 3.2 Banco de dados (Supabase)
-- **Projeto:** `monitor-meet-producao`
-- **URL:** `https://wuywqkgnqvcciqychzll.supabase.co`
-- **Tabela:** `gravacoes_meet` com os campos:
-  - `id` (uuid, chave primária)
-  - `meeting_code` (código de 10 letras da sala, ex: `abc-defg-hij`)
-  - `space_name` (ID canônico, ex: `spaces/jMGTLqH9uBEB`)
-  - `user_email` (email do closer dono da agenda)
-  - `titulo_evento` (título do evento no Google Agenda)
-  - `status` (`sucesso` ou `erro`)
-  - `mensagem_erro` (detalhes em caso de falha)
-  - `processado_em` (timestamp automático)
-- **Índice único:** `(meeting_code, user_email)` — evita reprocessamento
-
-### 3.3 Código-fonte
-- **Repositório GitHub:** `github.com/especialista42-debug/monitor-meet-producao`
-- **Arquivo principal:** `monitor.py`
-- **Dependências:** `requirements.txt`
-- **Execução automática:** `.github/workflows/monitor.yml` (cron a cada 5 minutos)
-
-### 3.4 Estado atual
-O sistema está **funcionando em produção** mas com autenticação OAuth pessoal (email da supervisora). Isso significa que por enquanto só monitora a agenda dela. Para monitorar todos os closers, é necessário concluir a migração para service account com domain-wide delegation (descrita nas seções 4 e 5).
+- [ ] **Google Cloud Console** — para criar projeto, APIs e service account
+- [ ] **Google Workspace Admin Console** (admin.google.com) — para conceder delegação de domínio
+- [ ] **Conta no Supabase** (supabase.com) — banco de dados gratuito
+- [ ] **Conta no GitHub** — para hospedar o código e rodar o GitHub Actions
+- [ ] **Lista de emails dos closers** a serem monitorados
 
 ---
 
-## 4. O que o time de TI precisa fazer
+## Parte 1 — Google Cloud
 
-### Tarefa única: conceder Domain-Wide Delegation no Google Workspace
+### 1.1 Criar o projeto
 
-**O que é:** autorizar a conta de serviço do robô a acessar agendas e configurações de reuniões de qualquer usuário do domínio, sem que cada um precise autorizar individualmente.
+1. Acesse **console.cloud.google.com**
+2. Clique no seletor de projeto no topo → **Novo projeto**
+3. Nome sugerido: `monitor-gravacao-meet`
+4. Anote o **ID do projeto** gerado (será usado nos próximos passos)
+5. Clique em **Criar**
 
-**Por que é necessário:** o Google Workspace, por padrão, não permite que sistemas externos acessem dados de usuários. A delegação em todo o domínio é o mecanismo oficial do Google para isso.
+### 1.2 Habilitar as APIs necessárias
 
-**Pré-requisito:** acesso de administrador ao Google Workspace (admin.google.com)
+Com o projeto selecionado:
+
+1. No menu lateral: **APIs e serviços → Biblioteca**
+2. Busque e habilite cada uma das APIs abaixo (uma por vez):
+   - **Google Meet REST API**
+   - **Google Calendar API**
+
+Para cada uma: clique na API → clique em **Ativar**
+
+### 1.3 Configurar a tela de consentimento OAuth
+
+> Necessário para que o Google reconheça o projeto como aplicação autorizada.
+
+1. Menu lateral: **APIs e serviços → Tela de consentimento OAuth**
+2. Tipo de usuário: **Interno** (só usuários do domínio da empresa)
+3. Clique em **Criar**
+4. Preencha:
+   - **Nome do app:** `Monitor Gravação Meet`
+   - **E-mail de suporte:** email do responsável técnico
+   - **Domínio autorizado:** domínio da empresa (ex: `empresa.com`)
+5. Clique em **Salvar e continuar** até o final
+
+### 1.4 Criar a conta de serviço (service account)
+
+A conta de serviço é a "identidade" do robô no Google Cloud.
+
+1. Menu lateral: **IAM e administrador → Contas de serviço**
+2. Clique em **+ Criar conta de serviço**
+3. Preencha:
+   - **Nome:** `monitor-gravacao-meet`
+   - **ID:** será preenchido automaticamente
+   - **Descrição:** `Robô de gravação automática Google Meet`
+4. Clique em **Criar e continuar**
+5. Na tela de permissões: **não adicione nenhuma** — clique em **Continuar**
+6. Clique em **Concluir**
+
+### 1.5 Gerar a chave JSON da service account
+
+1. Na lista de contas de serviço, clique na conta criada
+2. Clique na aba **Chaves**
+3. Clique em **Adicionar chave → Criar nova chave**
+4. Selecione **JSON** → clique em **Criar**
+5. Um arquivo `.json` será baixado automaticamente — **guarde com segurança**
+6. **Nunca commitar este arquivo no GitHub**
+
+### 1.6 Anotar o Client ID
+
+1. Na mesma tela da conta de serviço, clique na aba **Detalhes**
+2. Anote o **ID exclusivo** (número longo, ex: `123456789012345678901`)
+3. Este número será usado na configuração do Google Workspace Admin
 
 ---
 
-### Passo a passo
+## Parte 2 — Google Workspace Admin Console
 
-**Passo 1 — Acessar o Admin Console**
-1. Abra o navegador e acesse: **admin.google.com**
-2. Entre com a conta de administrador do Google Workspace da empresa
+Esta é a etapa que permite ao robô acessar agendas e reuniões de todos os closers do domínio.
 
-**Passo 2 — Navegar até Delegação em Todo o Domínio**
-1. No menu lateral esquerdo, clique em **Segurança**
-2. Clique em **Controles de acesso e dados**
-3. Clique em **Controles de API**
-4. Role a página até encontrar a seção **Delegação em todo o domínio**
-5. Clique em **Gerenciar delegação em todo o domínio**
+### 2.1 Conceder Domain-Wide Delegation
 
-> Se não encontrar o caminho acima, use a barra de pesquisa do Admin Console e busque por "Delegação em todo o domínio"
+1. Acesse **admin.google.com** com a conta de administrador do Workspace
+2. No menu lateral: **Segurança → Controles de acesso e dados → Controles de API**
+3. Role até **Delegação em todo o domínio**
+4. Clique em **Gerenciar delegação em todo o domínio**
+5. Clique em **Adicionar novo**
+6. Preencha os campos:
 
-**Passo 3 — Adicionar a conta de serviço**
-1. Clique no botão **Adicionar novo**
-2. Uma janela vai abrir com dois campos
+**ID do cliente:** cole o número anotado no passo 1.6
 
-**Passo 4 — Preencher o ID do cliente**
-
-No campo **ID do cliente**, cole exatamente o número abaixo:
-```
-116621524327967144081
-```
-
-**Passo 5 — Preencher os escopos OAuth**
-
-No campo **Escopos OAuth**, cole exatamente o texto abaixo (tudo em uma linha, sem quebra):
+**Escopos OAuth:** cole exatamente o texto abaixo (tudo em uma linha):
 ```
 https://www.googleapis.com/auth/calendar.events.readonly,https://www.googleapis.com/auth/meetings.space.settings,https://www.googleapis.com/auth/meetings.space.readonly
 ```
 
-**Passo 6 — Salvar**
-1. Clique em **Autorizar**
-2. A entrada vai aparecer na lista com o Client ID e os escopos
+7. Clique em **Autorizar**
 
-**Passo 7 — Confirmar**
-Avisar a supervisora Camilli que a delegação foi concluída. Ela vai coordenar os próximos passos técnicos.
+### O que cada escopo permite
 
----
-
-### O que cada escopo faz
-
-| Escopo | Permissão | Justificativa |
-|--------|-----------|---------------|
-| `calendar.events.readonly` | Leitura dos eventos da agenda | Necessário para saber quais reuniões cada closer tem |
-| `meetings.space.settings` | Alterar configurações da sala do Meet | Necessário para ativar a gravação automática |
-| `meetings.space.readonly` | Leitura das informações da sala | Necessário para resolver o ID canônico da sala antes de alterar |
+| Escopo | O que faz |
+|--------|-----------|
+| `calendar.events.readonly` | Lê os eventos da agenda (somente leitura) |
+| `meetings.space.settings` | Ativa gravação automática na sala do Meet |
+| `meetings.space.readonly` | Lê informações da sala (necessário para obter o ID canônico) |
 
 ---
 
-## 5. Migração para conta de serviço (feita pela supervisão com suporte técnico)
+## Parte 3 — Supabase (banco de dados)
 
-Após o TI concluir a delegação, o script precisa ser atualizado para usar a conta de serviço em vez da autenticação OAuth pessoal. Esta etapa é feita pela supervisão comercial com suporte técnico.
+O Supabase é usado para guardar quais reuniões já foram processadas, evitando que o robô ative a gravação mais de uma vez na mesma sala.
 
-**Resumo das mudanças:**
-- Adicionar o arquivo JSON da conta de serviço como secret no GitHub (`SERVICE_ACCOUNT_JSON`)
-- Atualizar o `monitor.py` para usar `service_account.Credentials` com impersonação por email
-- Remover os secrets de OAuth pessoal (`OAUTH_TOKEN_BASE64`, `OAUTH_CLIENT_SECRETS_BASE64`)
+### 3.1 Criar o projeto
 
-**Para referência do TI — como o script vai autenticar após a migração:**
+1. Acesse **supabase.com** e faça login (ou crie conta da empresa)
+2. Clique em **New project**
+3. Preencha:
+   - **Name:** `monitor-meet-producao`
+   - **Database Password:** crie uma senha forte e guarde
+   - **Region:** South America (São Paulo)
+4. Clique em **Create new project** e aguarde ~2 minutos
+
+### 3.2 Criar a tabela
+
+1. No painel do projeto, clique em **SQL Editor** no menu lateral
+2. Cole o código abaixo e clique em **Run**:
+
+```sql
+CREATE TABLE gravacoes_meet (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  meeting_code text NOT NULL,
+  space_name text,
+  user_email text NOT NULL,
+  titulo_evento text,
+  status text NOT NULL,
+  mensagem_erro text,
+  processado_em timestamptz DEFAULT now()
+);
+
+CREATE UNIQUE INDEX idx_gravacoes_meet_codigo_email
+  ON gravacoes_meet (meeting_code, user_email);
+```
+
+Deve aparecer: **"Success. No rows returned"**
+
+### 3.3 Pegar as credenciais
+
+1. No menu lateral: **Project Settings → API**
+2. Copie e guarde:
+   - **Project URL** (começa com `https://`)
+   - **Secret key** (começa com `sb_secret_`) — não usar a Publishable key
+
+---
+
+## Parte 4 — GitHub
+
+### 4.1 Criar o repositório
+
+1. Acesse **github.com** na conta da empresa
+2. Clique em **New repository**
+3. Preencha:
+   - **Name:** `monitor-meet-producao`
+   - **Visibility:** Private
+   - **Não inicializar** com README, .gitignore ou license
+4. Clique em **Create repository**
+
+### 4.2 Criar os arquivos do projeto
+
+Crie os seguintes arquivos no repositório. O conteúdo de cada um está abaixo.
+
+---
+
+#### Arquivo: `monitor.py`
+
 ```python
+import os
+import sys
+import pickle
+import base64
+import logging
+import tempfile
+from datetime import datetime, timezone, timedelta
+
+import requests
+from google.auth.transport.requests import Request
 from google.oauth2 import service_account
+from supabase import create_client
 
-credentials = service_account.Credentials.from_service_account_info(
-    service_account_json,
-    scopes=SCOPES
-).with_subject(email_do_closer)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
+SCOPES = [
+    'https://www.googleapis.com/auth/calendar.events.readonly',
+    'https://www.googleapis.com/auth/meetings.space.settings',
+    'https://www.googleapis.com/auth/meetings.space.readonly',
+]
+
+
+def get_credentials(email):
+    """Retorna credenciais da service account impersonando o email do closer."""
+    sa_json_b64 = os.environ.get('SERVICE_ACCOUNT_JSON_BASE64')
+    if not sa_json_b64:
+        raise ValueError('SERVICE_ACCOUNT_JSON_BASE64 nao configurado')
+
+    import json
+    sa_info = json.loads(base64.b64decode(sa_json_b64).decode('utf-8'))
+
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info, scopes=SCOPES
+    ).with_subject(email)
+
+    return creds
+
+
+def get_calendar_events(creds, email):
+    now = datetime.now(timezone.utc).isoformat()
+    end = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+
+    creds.refresh(Request())
+    url = f'https://www.googleapis.com/calendar/v3/calendars/{email}/events'
+    headers = {'Authorization': f'Bearer {creds.token}'}
+    params = {
+        'timeMin': now,
+        'timeMax': end,
+        'singleEvents': True,
+        'orderBy': 'startTime',
+        'maxResults': 250,
+    }
+
+    resp = requests.get(url, headers=headers, params=params)
+    resp.raise_for_status()
+    return resp.json().get('items', [])
+
+
+def extract_meet_code(event):
+    conf = event.get('conferenceData', {})
+    solution = conf.get('conferenceSolution', {})
+
+    if solution.get('key', {}).get('type') != 'hangoutsMeet':
+        return None
+
+    for ep in conf.get('entryPoints', []):
+        if ep.get('entryPointType') == 'video':
+            uri = ep.get('uri', '')
+            code = uri.split('/')[-1].split('?')[0]
+            if code:
+                return code
+    return None
+
+
+def resolve_space_name(creds, meeting_code):
+    url = f'https://meet.googleapis.com/v2/spaces/{meeting_code}'
+    headers = {'Authorization': f'Bearer {creds.token}'}
+
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    return resp.json().get('name')
+
+
+def enable_auto_recording(creds, space_name):
+    url = f'https://meet.googleapis.com/v2/{space_name}'
+    headers = {
+        'Authorization': f'Bearer {creds.token}',
+        'Content-Type': 'application/json',
+    }
+    params = {'updateMask': 'config.artifactConfig.recordingConfig.autoRecordingGeneration'}
+    body = {'config': {'artifactConfig': {'recordingConfig': {'autoRecordingGeneration': 'ON'}}}}
+
+    resp = requests.patch(url, headers=headers, params=params, json=body)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def already_processed(supabase, meeting_code, user_email):
+    result = supabase.table('gravacoes_meet').select('id').eq(
+        'meeting_code', meeting_code
+    ).eq('user_email', user_email).eq('status', 'sucesso').execute()
+    return len(result.data) > 0
+
+
+def register_in_supabase(supabase, data):
+    supabase.table('gravacoes_meet').upsert(data, on_conflict='meeting_code,user_email').execute()
+
+
+def process_email(supabase, email):
+    log.info(f'Verificando agenda de {email}')
+    creds = get_credentials(email)
+
+    events = get_calendar_events(creds, email)
+    seen_codes = set()
+    meet_events = []
+    for e in events:
+        c = extract_meet_code(e)
+        if c and c not in seen_codes:
+            seen_codes.add(c)
+            meet_events.append((e, c))
+
+    log.info(f'{len(meet_events)} reuniao(oes) unica(s) com Meet para {email}')
+
+    for event, meeting_code in meet_events:
+        titulo = event.get('summary', '(sem titulo)')
+
+        try:
+            if already_processed(supabase, meeting_code, email):
+                log.info(f'[SKIP] {titulo} ({meeting_code}) - ja processada')
+                continue
+
+            log.info(f'[PROCESSANDO] {titulo} ({meeting_code})')
+
+            space_name = resolve_space_name(creds, meeting_code)
+            log.info(f'  space_name: {space_name}')
+
+            enable_auto_recording(creds, space_name)
+
+            register_in_supabase(supabase, {
+                'meeting_code': meeting_code,
+                'space_name': space_name,
+                'user_email': email,
+                'titulo_evento': titulo,
+                'status': 'sucesso',
+            })
+
+            log.info(f'  [OK] Gravacao ativada: {titulo}')
+
+        except Exception as e:
+            log.error(f'  [ERRO] {titulo} ({meeting_code}): {e}')
+            try:
+                register_in_supabase(supabase, {
+                    'meeting_code': meeting_code,
+                    'space_name': None,
+                    'user_email': email,
+                    'titulo_evento': titulo,
+                    'status': 'erro',
+                    'mensagem_erro': str(e),
+                })
+            except Exception as e2:
+                log.error(f'  [ERRO] Falha ao registrar no Supabase: {e2}')
+
+
+def main():
+    supabase_url = os.environ['SUPABASE_URL']
+    supabase_key = os.environ['SUPABASE_KEY']
+    emails_str = os.environ.get('EMAILS_MONITORADOS', '')
+
+    emails = [e.strip() for e in emails_str.split(',') if e.strip()]
+    if not emails:
+        log.error('EMAILS_MONITORADOS esta vazio.')
+        sys.exit(1)
+
+    log.info('=== Monitor de Gravacoes Google Meet ===')
+    log.info(f'Emails monitorados: {len(emails)} closer(s)')
+
+    supabase = create_client(supabase_url, supabase_key)
+
+    log.info('--- Iniciando ciclo ---')
+    for email in emails:
+        try:
+            process_email(supabase, email)
+        except Exception as e:
+            log.error(f'Erro geral ao processar {email}: {e}')
+
+    log.info('--- Ciclo concluido ---')
+
+
+if __name__ == '__main__':
+    main()
 ```
 
 ---
 
-## 6. Adicionar os closers ao monitoramento
+#### Arquivo: `requirements.txt`
 
-Após a migração para service account, a supervisora adiciona os emails dos closers no GitHub:
-
-1. Acessar o repositório no GitHub
-2. Ir em **Settings → Secrets and variables → Actions**
-3. Editar o secret `EMAILS_MONITORADOS`
-4. Adicionar os emails separados por vírgula:
-   ```
-   closer1@empresa.com,closer2@empresa.com,closer3@empresa.com
-   ```
-
-O robô passa a monitorar todos os emails listados na próxima execução (até 5 minutos).
+```
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+requests==2.32.3
+supabase==2.31.0
+```
 
 ---
 
-## 7. Como validar que está funcionando
+#### Arquivo: `.github/workflows/monitor.yml`
 
-### Verificar execuções no GitHub Actions
-1. Acesse `github.com/especialista42-debug/monitor-meet-producao`
-2. Clique em **Actions**
-3. A lista mostra todas as execuções — deve haver uma nova a cada ~5 minutos
-4. Clique em qualquer execução e expanda o passo **"Executar monitor"**
-5. O log deve mostrar algo como:
-   ```
-   [OK] Gravacao ativada: Nome da Reunião
-   ```
-   ou
-   ```
-   [SKIP] Nome da Reunião - ja processada
-   ```
+> Criar a pasta `.github/workflows/` e dentro dela o arquivo `monitor.yml`
 
-### Verificar no banco de dados (Supabase)
-1. Acessar o projeto Supabase em supabase.com
-2. Ir em **Table Editor → gravacoes_meet**
-3. Cada linha é uma reunião processada com status `sucesso` ou `erro`
+```yaml
+name: Monitor Gravacoes Meet
 
-### Testar com uma reunião real
-1. Um closer cria um evento no **Google Agenda** com link do Google Meet
-2. Aguardar até 5 minutos
-3. Verificar no log do GitHub Actions que a reunião foi processada
-4. Entrar na reunião e confirmar que a gravação inicia automaticamente
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Executar monitor
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMAILS_MONITORADOS: ${{ secrets.EMAILS_MONITORADOS }}
+          SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.SERVICE_ACCOUNT_JSON_BASE64 }}
+        run: python monitor.py
+```
 
 ---
 
-## 8. Manutenção e troubleshooting
+#### Arquivo: `.gitignore`
 
-### O robô parou de funcionar
-1. Verificar **Actions** no GitHub — ver se as execuções estão com erro (ícone vermelho)
-2. Abrir a execução com erro e ler o log do passo "Executar monitor"
-3. Erros comuns:
-   - `401 Unauthorized`: token OAuth expirou → refazer autenticação OAuth ou verificar service account
-   - `403 Forbidden`: permissão insuficiente → verificar delegação no Admin Console
-   - `Invalid API key`: chave do Supabase inválida → atualizar secret `SUPABASE_KEY`
-
-### GitHub Actions parou de disparar automaticamente
-- Repositórios públicos com inatividade por mais de 60 dias têm os workflows pausados
-- Para reativar: ir em **Actions → Monitor Gravacoes Meet → Enable workflow**
-
-### Adicionar ou remover um closer
-- Editar o secret `EMAILS_MONITORADOS` no GitHub (Settings → Secrets and variables → Actions)
-
-### Token OAuth expirou (fase atual, antes da service account)
-- O token OAuth tem validade longa mas pode expirar se revogado
-- Sintoma: log mostra erro 401
-- Solução: refazer a autenticação localmente e atualizar o secret `OAUTH_TOKEN_BASE64`
+```
+*.json
+*.pickle
+.env
+__pycache__/
+venv/
+.DS_Store
+```
 
 ---
 
-## 9. Referência de credenciais e acessos
+### 4.3 Configurar os Secrets do GitHub Actions
 
-| Componente | Onde acessar | Responsável |
-|-----------|-------------|-------------|
-| Google Cloud Console | console.cloud.google.com | Supervisão Comercial |
-| Google Admin Console | admin.google.com | TI |
-| Repositório GitHub | github.com/especialista42-debug/monitor-meet-producao | Supervisão Comercial |
-| Banco de dados Supabase | supabase.com | Supervisão Comercial |
-| JSON da service account | Armazenado com a supervisão | Supervisão Comercial |
-| Secrets do GitHub Actions | GitHub → Settings → Secrets | Supervisão Comercial |
+Os secrets são variáveis de ambiente sigilosas que o GitHub injeta no script durante a execução.
+
+1. No repositório, clique em **Settings**
+2. No menu lateral: **Secrets and variables → Actions**
+3. Clique em **New repository secret** para cada secret abaixo:
+
+| Nome do secret | Valor |
+|----------------|-------|
+| `SUPABASE_URL` | URL do projeto Supabase (ex: `https://xxxxx.supabase.co`) |
+| `SUPABASE_KEY` | Secret key do Supabase (começa com `sb_secret_`) |
+| `EMAILS_MONITORADOS` | Emails dos closers separados por vírgula |
+| `SERVICE_ACCOUNT_JSON_BASE64` | Conteúdo do arquivo JSON da service account em base64 (ver abaixo) |
+
+#### Como gerar o SERVICE_ACCOUNT_JSON_BASE64
+
+No terminal (Mac/Linux):
+```bash
+base64 -i caminho/para/service-account.json | tr -d '\n'
+```
+
+No Windows (PowerShell):
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("caminho\service-account.json"))
+```
+
+Cole o resultado como valor do secret `SERVICE_ACCOUNT_JSON_BASE64`.
 
 ---
 
-## Escopos OAuth (para referência rápida)
+## Parte 5 — Validar que está funcionando
 
+### 5.1 Disparar o workflow manualmente
+
+1. No repositório GitHub, clique em **Actions**
+2. No lado esquerdo, clique em **Monitor Gravacoes Meet**
+3. Clique em **Run workflow → Run workflow**
+4. Aguarde a execução completar (ícone verde = sucesso, vermelho = erro)
+
+### 5.2 Interpretar o log
+
+Clique na execução → clique em **monitor** → expanda **Executar monitor**
+
+Logs esperados:
 ```
-https://www.googleapis.com/auth/calendar.events.readonly
-https://www.googleapis.com/auth/meetings.space.settings
-https://www.googleapis.com/auth/meetings.space.readonly
+[OK] Gravacao ativada: Nome da Reunião     ← gravação ativada com sucesso
+[SKIP] Nome da Reunião - ja processada     ← já foi processada antes, pulou
+[ERRO] Nome da Reunião: mensagem           ← algo deu errado (ver troubleshooting)
 ```
 
-## Client ID da service account
+### 5.3 Verificar no Supabase
 
-```
-116621524327967144081
-```
+1. Acesse o projeto no Supabase
+2. Clique em **Table Editor → gravacoes_meet**
+3. Cada linha representa uma reunião processada
 
-## Projeto Google Cloud
+### 5.4 Teste end-to-end
 
-```
-meet-auto-record-test (ID: 372339982498)
-```
+1. Um closer cria um evento no **Google Agenda** para qualquer data futura, com link do Google Meet
+2. Aguarda até 5 minutos
+3. Verifica no log do GitHub Actions que aparece `[OK] Gravacao ativada`
+4. Entra na reunião e confirma que a gravação inicia automaticamente
+
+---
+
+## Troubleshooting
+
+| Erro no log | Causa provável | Solução |
+|-------------|---------------|---------|
+| `SERVICE_ACCOUNT_JSON_BASE64 nao configurado` | Secret não foi adicionado | Adicionar o secret no GitHub |
+| `401 Unauthorized` | Service account sem permissão ou delegação não configurada | Verificar Parte 2 (domain-wide delegation) |
+| `403 Forbidden` | Escopo insuficiente ou delegação com escopos errados | Refazer o passo 2.1 com os escopos corretos |
+| `Invalid API key` | Chave do Supabase incorreta | Atualizar secret `SUPABASE_KEY` |
+| Workflow não executa automaticamente | Repositório inativo por 60+ dias | Ir em Actions → Enable workflow |
+
+---
+
+## Manutenção
+
+**Adicionar um closer:** editar o secret `EMAILS_MONITORADOS` no GitHub adicionando o email separado por vírgula.
+
+**Remover um closer:** editar o secret `EMAILS_MONITORADOS` removendo o email.
+
+**Ver histórico de reuniões processadas:** Supabase → Table Editor → `gravacoes_meet`.
+
+**Custo:** o sistema roda inteiramente dentro dos planos gratuitos do GitHub Actions e Supabase. O único custo é zero.
